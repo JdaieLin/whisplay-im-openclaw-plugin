@@ -172,9 +172,19 @@ function resolveInboundPeer(inbound) {
         peerId,
     );
     return {
-        id: peerId || "unknown",
-        name: peerName || "unknown",
+        id: peerId || "whisplay",
+        name: peerName || "whisplay",
     };
+}
+
+function sanitizeSessionPart(value) {
+    return String(value ?? "")
+        .trim()
+        .replace(/[:\s]+/g, "-")
+        .replace(/[^a-zA-Z0-9._-]/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 96);
 }
 
 async function loadGetReplyFromConfig() {
@@ -473,10 +483,11 @@ async function emitInboundToGateway(ctx, inbound) {
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
     const senderName = peer.name;
-    const messageSid = inbound.id ? String(inbound.id) : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
-    const sessionKey = `${CHANNEL_ID}:${ctx.accountId}:${senderId || "unknown"}`;
+    const peerKey = sanitizeSessionPart(senderId || inbound.id || "unknown") || "unknown";
+    const accountKey = sanitizeSessionPart(ctx.accountId || "default") || "default";
+    const sessionKey = `agent:main:${CHANNEL_ID}:${accountKey}:direct:${peerKey}`;
 
     const inboundCtx = {
         Body: inbound.text,
@@ -485,12 +496,8 @@ async function emitInboundToGateway(ctx, inbound) {
         RawBody: inbound.text,
         CommandBody: inbound.text,
         SessionKey: sessionKey,
-        ConversationLabel: `${CHANNEL_ID}`,
         AccountId: ctx.accountId,
-        MessageSid: messageSid,
-        SenderId: senderId || undefined,
         SenderName: senderName || undefined,
-        SenderUsername: senderName || undefined,
         Timestamp: parsedTimestamp,
         From: senderId || undefined,
         To: senderId || undefined,
