@@ -5,8 +5,11 @@ const CHANNEL_ID = "whisplay-im";
 const GATEWAY_LOG_DIR = "/tmp/openclaw";
 const GATEWAY_LOG_FILE_PATTERN = /^openclaw-\d{4}-\d{2}-\d{2}\.log$/;
 const PAIRING_CACHE_LIMIT = 256;
+const INBOUND_CACHE_LIMIT = 512;
 
 const pairingRelaySeen = new Map();
+const inboundSeenByAccount = new Map();
+const pollTickByAccount = new Map();
 
 function getPairingSeenSet(accountId) {
     const key = String(accountId ?? "default");
@@ -32,6 +35,47 @@ function rememberPairingKey(seen, value) {
         }
         seen.delete(first.value);
     }
+}
+
+function getInboundSeenSet(accountId) {
+    const key = String(accountId ?? "default");
+    let seen = inboundSeenByAccount.get(key);
+    if (!seen) {
+        seen = new Set();
+        inboundSeenByAccount.set(key, seen);
+    }
+    return seen;
+}
+
+function rememberInboundKey(seen, value) {
+    seen.add(value);
+    if (seen.size <= INBOUND_CACHE_LIMIT) {
+        return;
+    }
+    const overflow = seen.size - INBOUND_CACHE_LIMIT;
+    const iterator = seen.values();
+    for (let index = 0; index < overflow; index += 1) {
+        const first = iterator.next();
+        if (first.done) {
+            break;
+        }
+        seen.delete(first.value);
+    }
+}
+
+function buildInboundDedupeKey(inbound) {
+    const idPart = inbound.id ? `id:${inbound.id}` : "";
+    const tsPart = inbound.timestamp ? `ts:${inbound.timestamp}` : "";
+    const textPart = `text:${String(inbound.text ?? "").trim()}`;
+    return [idPart, tsPart, textPart].filter(Boolean).join("|");
+}
+
+function nextPollTick(accountId) {
+    const key = String(accountId ?? "default");
+    const current = pollTickByAccount.get(key) ?? 0;
+    const next = current + 1;
+    pollTickByAccount.set(key, next);
+    return next;
 }
 
 async function findLatestGatewayLogFile() {
@@ -192,6 +236,90 @@ async function sendReply(baseUrl, token, reply) {
     }
 
     return { ok: true, channel: CHANNEL_ID };
+}
+
+function normalizeInboundItems(payload) {
+    if (!payload || typeof payload !== "object") {
+        return [];
+    }
+
+    const results = [];
+    const list = Array.isArray(payload.messages) ? payload.messages : [];
+
+    if (list.length > 0) {
+        for (const item of list) {
+            if (!item || typeof item !== "object") {
+                continue;
+            }
+            const text =
+                typeof item.content === "string"
+                    ? item.content
+                    : typeof item.message === "string"
+                        ? item.message
+                        : "";
+            if (!text.trim()) {
+                continue;
+            }
+            results.push({
+                text,
+                id:
+                    typeof item.id === "string" || typeof item.id === "number"
+                        ? String(item.id)
+                        : "",
+                timestamp:
+                    typeof item.timestamp === "string" || typeof item.timestamp === "number"
+                        ? String(item.timestamp)
+                        : "",
+                raw: item,
+            });
+        }
+        return results;
+    }
+
+    const single = typeof payload.message === "string" ? payload.message : "";
+    if (single.trim()) {
+        results.push({ text: single, id: "", timestamp: "", raw: payload });
+    }
+    return results;
+}
+
+async function emitInboundToGateway(ctx, inbound) {
+    const candidates = [
+        "emitInbound",
+        "emitInboundMessage",
+        "dispatchInbound",
+        "dispatchMessage",
+        "pushInbound",
+        "onInbound",
+    ];
+
+    const payload = {
+        accountId: ctx.accountId,
+        channel: CHANNEL_ID,
+        text: inbound.text,
+        content: inbound.text,
+        message: inbound.text,
+        source: {
+            channel: CHANNEL_ID,
+            accountId: ctx.accountId,
+            externalId: inbound.id || undefined,
+        },
+        meta: {
+            timestamp: inbound.timestamp || undefined,
+            raw: inbound.raw,
+        },
+    };
+
+    for (const methodName of candidates) {
+        const method = ctx?.[methodName];
+        if (typeof method !== "function") {
+            continue;
+        }
+        await method.call(ctx, payload);
+        return methodName;
+    }
+
+    throw new Error("no inbound dispatch method found on gateway context");
 }
 
 async function relayGatewayPairingHints({ accountId, baseUrl, token, log, notBeforeMs }) {
@@ -430,7 +558,26 @@ const whisplayImChannel = {
                             throw new Error(`poll failed: HTTP ${response.status}${body ? ` ${body}` : ""}`);
                         }
                         const payload = await response.json().catch(() => ({}));
-                        if (payload && typeof payload === "object" && (payload.message || payload.messages)) {
+                        const pollTick = nextPollTick(ctx.accountId);
+                        const inbounds = normalizeInboundItems(payload);
+                        if (inbounds.length > 0) {
+                            ctx.log?.warn?.(
+                                `[${ctx.accountId}] poll received ${inbounds.length} inbound message(s)`,
+                            );
+                            const seen = getInboundSeenSet(ctx.accountId);
+                            for (const inbound of inbounds) {
+                                const dedupeKey = buildInboundDedupeKey(inbound);
+                                if (dedupeKey && seen.has(dedupeKey)) {
+                                    continue;
+                                }
+                                const methodName = await emitInboundToGateway(ctx, inbound);
+                                if (dedupeKey) {
+                                    rememberInboundKey(seen, dedupeKey);
+                                }
+                                ctx.log?.debug?.(
+                                    `[${ctx.accountId}] inbound relayed via ${methodName}: ${inbound.text.slice(0, 120)}`,
+                                );
+                            }
                             ctx.setStatus({
                                 ...ctx.getStatus(),
                                 accountId: ctx.accountId,
@@ -440,6 +587,10 @@ const whisplayImChannel = {
                                 lastInboundAt: Date.now(),
                                 lastError: null,
                             });
+                        } else {
+                            ctx.log?.warn?.(
+                                `[${ctx.accountId}] poll active: no inbound messages yet (ticks=${pollTick})`,
+                            );
                         }
                     } catch (error) {
                         if (isAborted()) {
