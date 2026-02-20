@@ -1,0 +1,20 @@
+{
+  "name": "whisplay-im",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "channel": {
+      "id": "whisplay-im",
+      "label": "Whisplay IM",
+      "selectionLabel": "Whisplay IM (HTTP bridge)",
+      "docsPath": "/channels/whisplay-im",
+      "blurb": "Whisplay IM bridge channel via poll/send endpoints.",
+      "aliases": ["whisplayim"]
+    },
+    "install": {
+      "localPath": "whisplay-im"
+    }
+  }
+}
