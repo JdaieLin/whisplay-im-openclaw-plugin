@@ -8,18 +8,38 @@
 
 ## Contents
 
-- `whisplay-im/whisplay_im_channel.py`: Channel implementation and CLI
+- `whisplay-im/index.js`: OpenClaw channel plugin implementation
 - `whisplay-im/openclaw.channel.json`: OpenClaw config page field definitions (`ip`, `token`, `waitSec`)
-- `whisplay-im/requirements.txt`: Dependencies
+- `whisplay-im/openclaw.plugin.json`: plugin metadata
+- `whisplay-im/SKILL.md`: protocol contract
 
 ## Installation
 
+This channel is a JavaScript OpenClaw plugin. No Python runtime is required.
+
+### 1) Place plugin in OpenClaw extensions
+
+Set `plugins.installs.whisplay-im.sourcePath` in your `~/.openclaw/openclaw.json` to:
+
+`/absolute/path/to/whisplay-im-openclaw-plugin/whisplay-im`
+
+Or copy `whisplay-im/index.js` into your installed extension directory:
+
+`~/.openclaw/extensions/whisplay-im/index.js`
+
+### 2) Restart gateway
+
 ```bash
-cd whisplay-im
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+openclaw gateway restart
 ```
+
+### 3) Verify plugin is loaded
+
+```bash
+openclaw channels status
+```
+
+You should see `Whisplay IM` in configured/running channels.
 
 ## OpenClaw Page Configuration
 
@@ -40,13 +60,19 @@ Example:
 ### 1) Poll user messages
 
 ```bash
-python whisplay_im_channel.py --ip 192.168.1.50:18888 --token "" poll --wait-sec 30
+curl -X GET \
+	-H "Authorization: Bearer <token>" \
+	"http://<device-host>:18888/whisplay-im/poll?waitSec=30"
 ```
 
 ### 2) Send reply messages
 
 ```bash
-python whisplay_im_channel.py --ip 192.168.1.50:18888 send --reply "Hello, I am OpenClaw" --emoji "🤖"
+curl -X POST \
+	-H "Authorization: Bearer <token>" \
+	-H "Content-Type: application/json" \
+	-d '{"reply":"Hello, I am OpenClaw","emoji":"🤖"}' \
+	"http://<device-host>:18888/whisplay-im/send"
 ```
 
 ## OpenClaw Integration Notes

@@ -124,6 +124,59 @@ function payloadToReplyText(payload) {
     return "";
 }
 
+function toCleanText(value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
+    const text = String(value).trim();
+    return text;
+}
+
+function pickFirstText(...values) {
+    for (const value of values) {
+        const text = toCleanText(value);
+        if (text) {
+            return text;
+        }
+    }
+    return "";
+}
+
+function resolveInboundPeer(inbound) {
+    const raw = inbound?.raw ?? {};
+    const peerId = pickFirstText(
+        raw.senderId,
+        raw.sender,
+        raw.from,
+        raw.fromId,
+        raw.userId,
+        raw.uid,
+        raw.sessionId,
+        raw.session,
+        raw.chatId,
+        raw.chat,
+        raw.deviceId,
+        raw.device,
+        raw.peerId,
+        raw.peer,
+        inbound?.id,
+    );
+    const peerName = pickFirstText(
+        raw.senderName,
+        raw.name,
+        raw.nickname,
+        raw.displayName,
+        raw.userName,
+        raw.username,
+        raw.deviceName,
+        peerId,
+    );
+    return {
+        id: peerId || "unknown",
+        name: peerName || "unknown",
+    };
+}
+
 async function loadGetReplyFromConfig() {
     if (!getReplyFromConfigLoader) {
         getReplyFromConfigLoader = (async () => {
@@ -417,18 +470,9 @@ function normalizeInboundItems(payload) {
 }
 
 async function emitInboundToGateway(ctx, inbound) {
-    const senderId = String(
-        inbound?.raw?.senderId ??
-            inbound?.raw?.sender ??
-            inbound?.raw?.from ??
-            inbound?.raw?.fromId ??
-            inbound?.raw?.userId ??
-            inbound?.raw?.uid ??
-            "unknown",
-    ).trim();
-    const senderName = String(
-        inbound?.raw?.senderName ?? inbound?.raw?.name ?? inbound?.raw?.nickname ?? senderId,
-    ).trim();
+    const peer = resolveInboundPeer(inbound);
+    const senderId = peer.id;
+    const senderName = peer.name;
     const messageSid = inbound.id ? String(inbound.id) : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
@@ -441,6 +485,7 @@ async function emitInboundToGateway(ctx, inbound) {
         RawBody: inbound.text,
         CommandBody: inbound.text,
         SessionKey: sessionKey,
+        ConversationLabel: `${CHANNEL_ID}`,
         AccountId: ctx.accountId,
         MessageSid: messageSid,
         SenderId: senderId || undefined,
