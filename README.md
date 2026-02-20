@@ -65,6 +65,25 @@ Notes:
 - Keep `token` as empty string if your device API does not require auth.
 - `accounts.default` should match the account id used by channel runtime status.
 
+### 1.1.1) Single-device shorthand (also valid)
+
+If you only use one device, the following config is valid and supported:
+
+```json
+{
+	"channels": {
+		"whisplay-im": {
+			"ip": "192.168.100.93:18888",
+			"waitSec": 60,
+			"enabled": true,
+			"accounts": {}
+		}
+	}
+}
+```
+
+This shorthand maps to runtime account `default`.
+
 ### 1.2) Multi-device / multi-account `accounts` example
 
 If you connect multiple Whisplay devices, configure multiple account ids under `channels.whisplay-im.accounts`:
@@ -101,6 +120,7 @@ Notes:
 - `default` is recommended as the primary account id.
 - Account ids (`default`, `home`, `office`) become runtime account identifiers in channel status/logs.
 - You can use any stable id names; avoid spaces and keep them short.
+- Field precedence: for account `X`, values under `accounts.X` override top-level channel fields; if `accounts.X` is missing, top-level fields are used.
 
 ### 2) Restart gateway
 
