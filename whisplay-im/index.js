@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const CHANNEL_ID = "whisplay-im";
 const GATEWAY_LOG_DIR = "/tmp/openclaw";
@@ -10,6 +11,138 @@ const INBOUND_CACHE_LIMIT = 512;
 const pairingRelaySeen = new Map();
 const inboundSeenByAccount = new Map();
 const pollTickByAccount = new Map();
+let getReplyFromConfigLoader = null;
+
+async function fileExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function resolvePluginSdkIndexPath() {
+    const candidates = [
+        "/opt/homebrew/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
+        "/usr/local/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
+    ];
+
+    const openclawBinCandidates = ["/opt/homebrew/bin/openclaw", "/usr/local/bin/openclaw", "/opt/local/bin/openclaw"];
+    for (const binPath of openclawBinCandidates) {
+        try {
+            const realBin = await fs.realpath(binPath);
+            const packageRoot = path.dirname(realBin);
+            candidates.push(path.join(packageRoot, "dist/plugin-sdk/index.js"));
+        } catch {
+            // ignore missing binaries
+        }
+    }
+
+    for (const candidate of candidates) {
+        if (await fileExists(candidate)) {
+            return candidate;
+        }
+    }
+
+    throw new Error(
+        `cannot locate OpenClaw plugin-sdk index.js (checked: ${candidates.join(",")})`,
+    );
+}
+
+async function resolvePluginSdkReplyBundlePath() {
+    const indexPath = await resolvePluginSdkIndexPath();
+    const sdkDir = path.dirname(indexPath);
+    const entries = await fs.readdir(sdkDir, { withFileTypes: true });
+    const candidates = entries
+        .filter((entry) => entry.isFile() && /^reply-.*\.js$/.test(entry.name))
+        .map((entry) => path.join(sdkDir, entry.name))
+        .sort();
+
+    if (candidates.length === 0) {
+        throw new Error(`no reply bundle found under plugin-sdk dir: ${sdkDir}`);
+    }
+
+    return candidates[0];
+}
+
+async function resolveGetReplyFromConfigFn() {
+    const indexPath = await resolvePluginSdkIndexPath();
+    const sdkDir = path.dirname(indexPath);
+    const entries = await fs.readdir(sdkDir, { withFileTypes: true });
+    const candidates = entries
+        .filter((entry) => entry.isFile() && /^reply-.*\.js$/.test(entry.name))
+        .map((entry) => path.join(sdkDir, entry.name))
+        .sort();
+
+    const diagnostics = [];
+    for (const candidate of candidates) {
+        const replyModule = await import(pathToFileURL(candidate).href);
+        const byName = Object.values(replyModule).find(
+            (value) => typeof value === "function" && value.name === "getReplyFromConfig",
+        );
+        const fnNames = Object.values(replyModule)
+            .filter((value) => typeof value === "function")
+            .map((value) => value.name)
+            .filter(Boolean)
+            .slice(0, 10)
+            .join(",");
+        diagnostics.push(`${path.basename(candidate)}:${fnNames}`);
+        if (typeof byName === "function") {
+            return byName;
+        }
+    }
+
+    throw new Error(
+        `plugin-sdk getReplyFromConfig export is unavailable ` +
+            `(inspected=${diagnostics.join("|")})`,
+    );
+}
+
+function normalizeReplyPayloads(payload) {
+    if (!payload) {
+        return [];
+    }
+    return Array.isArray(payload) ? payload.filter(Boolean) : [payload];
+}
+
+function payloadToReplyText(payload) {
+    const text = String(payload?.text ?? "").trim();
+    if (text) {
+        return text;
+    }
+    const mediaUrl = String(payload?.mediaUrl ?? "").trim();
+    if (mediaUrl) {
+        return mediaUrl;
+    }
+    const mediaUrls = Array.isArray(payload?.mediaUrls)
+        ? payload.mediaUrls.map((value) => String(value ?? "").trim()).filter(Boolean)
+        : [];
+    if (mediaUrls.length > 0) {
+        return mediaUrls.join("\n");
+    }
+    return "";
+}
+
+async function loadGetReplyFromConfig() {
+    if (!getReplyFromConfigLoader) {
+        getReplyFromConfigLoader = (async () => {
+            const resolvedByProbe = await resolveGetReplyFromConfigFn();
+            if (typeof resolvedByProbe === "function") {
+                return resolvedByProbe;
+            }
+
+            const replyBundlePath = await resolvePluginSdkReplyBundlePath();
+            const replyModule = await import(pathToFileURL(replyBundlePath).href);
+            if (typeof replyModule?.t === "function") {
+                return replyModule.t;
+            }
+
+            throw new Error("plugin-sdk getReplyFromConfig export is unavailable");
+        })();
+    }
+    return getReplyFromConfigLoader;
+}
 
 function getPairingSeenSet(accountId) {
     const key = String(accountId ?? "default");
@@ -227,7 +360,7 @@ async function sendReply(baseUrl, token, reply) {
     const response = await fetch(`${baseUrl}/whisplay-im/send`, {
         method: "POST",
         headers: buildHeaders(token),
-        body: JSON.stringify({ reply }),
+        body: JSON.stringify({ reply, emoji: "🦞" }),
     });
 
     if (!response.ok) {
@@ -284,42 +417,71 @@ function normalizeInboundItems(payload) {
 }
 
 async function emitInboundToGateway(ctx, inbound) {
-    const candidates = [
-        "emitInbound",
-        "emitInboundMessage",
-        "dispatchInbound",
-        "dispatchMessage",
-        "pushInbound",
-        "onInbound",
-    ];
+    const senderId = String(
+        inbound?.raw?.senderId ??
+            inbound?.raw?.sender ??
+            inbound?.raw?.from ??
+            inbound?.raw?.fromId ??
+            inbound?.raw?.userId ??
+            inbound?.raw?.uid ??
+            "unknown",
+    ).trim();
+    const senderName = String(
+        inbound?.raw?.senderName ?? inbound?.raw?.name ?? inbound?.raw?.nickname ?? senderId,
+    ).trim();
+    const messageSid = inbound.id ? String(inbound.id) : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tsNumber = Number(inbound.timestamp);
+    const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
+    const sessionKey = `${CHANNEL_ID}:${ctx.accountId}:${senderId || "unknown"}`;
 
-    const payload = {
-        accountId: ctx.accountId,
-        channel: CHANNEL_ID,
-        text: inbound.text,
-        content: inbound.text,
-        message: inbound.text,
-        source: {
-            channel: CHANNEL_ID,
-            accountId: ctx.accountId,
-            externalId: inbound.id || undefined,
-        },
-        meta: {
-            timestamp: inbound.timestamp || undefined,
-            raw: inbound.raw,
-        },
+    const inboundCtx = {
+        Body: inbound.text,
+        BodyForAgent: inbound.text,
+        BodyForCommands: inbound.text,
+        RawBody: inbound.text,
+        CommandBody: inbound.text,
+        SessionKey: sessionKey,
+        AccountId: ctx.accountId,
+        MessageSid: messageSid,
+        SenderId: senderId || undefined,
+        SenderName: senderName || undefined,
+        SenderUsername: senderName || undefined,
+        Timestamp: parsedTimestamp,
+        From: senderId || undefined,
+        To: senderId || undefined,
+        ChatType: "direct",
+        Provider: CHANNEL_ID,
+        Surface: CHANNEL_ID,
+        OriginatingChannel: CHANNEL_ID,
+        OriginatingTo: senderId || undefined,
+        CommandAuthorized: true,
     };
 
-    for (const methodName of candidates) {
-        const method = ctx?.[methodName];
-        if (typeof method !== "function") {
+    const getReplyFromConfig = await loadGetReplyFromConfig();
+    const replyPayload = await getReplyFromConfig(inboundCtx, undefined, ctx.cfg);
+    const replies = normalizeReplyPayloads(replyPayload);
+    let sentCount = 0;
+    for (const payload of replies) {
+        const text = payloadToReplyText(payload);
+        if (!text) {
             continue;
         }
-        await method.call(ctx, payload);
-        return methodName;
+        await sendReply(normalizeBaseUrl(ctx.account?.ip), ctx.account?.token, text);
+        sentCount += 1;
+    }
+    if (sentCount > 0) {
+        ctx.setStatus({
+            ...ctx.getStatus(),
+            accountId: ctx.accountId,
+            running: true,
+            configured: true,
+            mode: "poll",
+            lastOutboundAt: Date.now(),
+            lastError: null,
+        });
     }
 
-    throw new Error("no inbound dispatch method found on gateway context");
+    return "plugin-sdk.auto-reply.getReplyFromConfig";
 }
 
 async function relayGatewayPairingHints({ accountId, baseUrl, token, log, notBeforeMs }) {
@@ -506,6 +668,9 @@ const whisplayImChannel = {
             }
 
             const isAborted = () => Boolean(ctx.abortSignal && ctx.abortSignal.aborted);
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: plugin-sdk.auto-reply.getReplyFromConfig`);
+            await loadGetReplyFromConfig();
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: getReplyFromConfig ready`);
             ctx.setStatus({
                 accountId: ctx.accountId,
                 configured: true,
@@ -596,6 +761,9 @@ const whisplayImChannel = {
                         if (isAborted()) {
                             break;
                         }
+                        ctx.log?.warn?.(
+                            `[${ctx.accountId}] poll loop error: ${error instanceof Error ? error.message : String(error)}`,
+                        );
                         ctx.setStatus({
                             ...ctx.getStatus(),
                             accountId: ctx.accountId,
