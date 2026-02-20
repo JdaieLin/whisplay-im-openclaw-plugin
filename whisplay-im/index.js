@@ -482,7 +482,8 @@ function normalizeInboundItems(payload) {
 async function emitInboundToGateway(ctx, inbound) {
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
-    const senderName = peer.name;
+    const accountName = toCleanText(ctx.account?.name);
+    const senderName = accountName ? `${peer.name} (${accountName})` : peer.name;
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
     const peerKey = sanitizeSessionPart(senderId || inbound.id || "unknown") || "unknown";
@@ -497,6 +498,7 @@ async function emitInboundToGateway(ctx, inbound) {
         CommandBody: inbound.text,
         SessionKey: sessionKey,
         AccountId: ctx.accountId,
+        ConversationLabel: senderName || undefined,
         SenderName: senderName || undefined,
         Timestamp: parsedTimestamp,
         From: senderId || undefined,
@@ -630,6 +632,7 @@ const whisplayImChannel = {
             const effective = resolveAccountSection(cfg, accountId);
             return {
                 accountId: effective.accountId,
+                name: typeof effective?.name === "string" ? effective.name : "",
                 enabled: effective?.enabled !== false,
                 ip: typeof effective?.ip === "string" ? effective.ip : "",
                 token: typeof effective?.token === "string" ? effective.token : "",
@@ -643,6 +646,7 @@ const whisplayImChannel = {
         isConfigured: (account) => Boolean(account?.configured),
         describeAccount: (account) => ({
             accountId: account?.accountId ?? "default",
+            name: account?.name ? String(account.name) : "",
             enabled: account?.enabled !== false,
             configured: Boolean(account?.configured),
             ip: account?.ip ? "[set]" : "[missing]",

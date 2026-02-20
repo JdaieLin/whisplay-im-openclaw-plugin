@@ -95,16 +95,19 @@ If you connect multiple Whisplay devices, configure multiple account ids under `
 			"enabled": true,
 			"accounts": {
 				"default": {
+					"name": "Default Device",
 					"ip": "192.168.1.50:18888",
 					"token": "",
 					"waitSec": 30
 				},
 				"home": {
+					"name": "Home",
 					"ip": "192.168.1.51:18888",
 					"token": "home-token",
 					"waitSec": 25
 				},
 				"office": {
+					"name": "Office",
 					"ip": "10.0.10.20:18888",
 					"token": "office-token",
 					"waitSec": 20
@@ -119,6 +122,7 @@ Notes:
 
 - `default` is recommended as the primary account id.
 - Account ids (`default`, `home`, `office`) become runtime account identifiers in channel status/logs.
+- `accounts.<id>.name` is used in Chat conversation labels (for example: `whisplay (Office)`).
 - You can use any stable id names; avoid spaces and keep them short.
 - Field precedence: for account `X`, values under `accounts.X` override top-level channel fields; if `accounts.X` is missing, top-level fields are used.
 
