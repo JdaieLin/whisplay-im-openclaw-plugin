@@ -27,6 +27,81 @@ Or copy `whisplay-im/index.js` into your installed extension directory:
 
 `~/.openclaw/extensions/whisplay-im/index.js`
 
+### 1.1) Complete `openclaw.json` example
+
+Use this as a complete, copy-ready example for `~/.openclaw/openclaw.json` (focused on `whisplay-im` related settings):
+
+```json
+{
+	"plugins": {
+		"allow": [
+			"whisplay-im"
+		],
+		"installs": {
+			"whisplay-im": {
+				"sourcePath": "/absolute/path/to/whisplay-im-openclaw-plugin/whisplay-im"
+			}
+		}
+	},
+	"channels": {
+		"whisplay-im": {
+			"enabled": true,
+			"accounts": {
+				"default": {
+					"ip": "192.168.1.50:18888",
+					"token": "",
+					"waitSec": 30
+				}
+			}
+		}
+	}
+}
+```
+
+Notes:
+
+- Replace `sourcePath` with your real absolute path.
+- `ip` supports both `host:port` and `http://host:port`.
+- Keep `token` as empty string if your device API does not require auth.
+- `accounts.default` should match the account id used by channel runtime status.
+
+### 1.2) Multi-device / multi-account `accounts` example
+
+If you connect multiple Whisplay devices, configure multiple account ids under `channels.whisplay-im.accounts`:
+
+```json
+{
+	"channels": {
+		"whisplay-im": {
+			"enabled": true,
+			"accounts": {
+				"default": {
+					"ip": "192.168.1.50:18888",
+					"token": "",
+					"waitSec": 30
+				},
+				"home": {
+					"ip": "192.168.1.51:18888",
+					"token": "home-token",
+					"waitSec": 25
+				},
+				"office": {
+					"ip": "10.0.10.20:18888",
+					"token": "office-token",
+					"waitSec": 20
+				}
+			}
+		}
+	}
+}
+```
+
+Notes:
+
+- `default` is recommended as the primary account id.
+- Account ids (`default`, `home`, `office`) become runtime account identifiers in channel status/logs.
+- You can use any stable id names; avoid spaces and keep them short.
+
 ### 2) Restart gateway
 
 ```bash
