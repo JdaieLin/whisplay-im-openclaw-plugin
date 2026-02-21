@@ -533,7 +533,8 @@ function normalizeInboundItems(payload) {
 async function emitInboundToGateway(ctx, inbound) {
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
-    const senderName = `${peer.name}(${toCleanText(ctx.account?.id) || "unknown"})`;
+    const accountLabel = toCleanText(ctx.accountId ?? ctx.account?.accountId ?? ctx.account?.id);
+    const senderName = `${peer.name}(${accountLabel || "unknown"})`;
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
     const peerKey = sanitizeSessionPart(senderId || inbound.id || "unknown") || "unknown";
