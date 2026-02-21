@@ -17,55 +17,20 @@
 
 This channel is a JavaScript OpenClaw plugin. No Python runtime is required.
 
-### 1) Place plugin in OpenClaw extensions
+### 1) Install plugin with OpenClaw CLI
 
-Set `plugins.installs.whisplay-im.sourcePath` in your `~/.openclaw/openclaw.json` to:
+Use `openclaw plugins install` with your local plugin path:
 
-`/absolute/path/to/whisplay-im-openclaw-plugin/whisplay-im`
-
-Or copy `whisplay-im/index.js` into your installed extension directory:
-
-`~/.openclaw/extensions/whisplay-im/index.js`
-
-### 1.1) Complete `openclaw.json` example
-
-Use this as a complete, copy-ready example for `~/.openclaw/openclaw.json` (focused on `whisplay-im` related settings):
-
-```json
-{
-	"plugins": {
-		"allow": [
-			"whisplay-im"
-		],
-		"installs": {
-			"whisplay-im": {
-				"sourcePath": "/absolute/path/to/whisplay-im-openclaw-plugin/whisplay-im"
-			}
-		}
-	},
-	"channels": {
-		"whisplay-im": {
-			"enabled": true,
-			"accounts": {
-				"default": {
-					"ip": "192.168.1.50:18888",
-					"token": "",
-					"waitSec": 60
-				}
-			}
-		}
-	}
-}
+```bash
+openclaw plugins install /absolute/path/to/whisplay-im-openclaw-plugin/whisplay-im --link
 ```
 
 Notes:
 
-- Replace `sourcePath` with your real absolute path.
-- `ip` supports both `host:port` and `http://host:port`.
-- Keep `token` as empty string if your device API does not require auth.
-- `accounts.default` should match the account id used by channel runtime status.
-- Device settings must be configured under `accounts.<id>` only.
-- Top-level `channels.whisplay-im.ip/token/waitSec` is deprecated and not supported.
+- Replace the path with your real absolute path.
+- `--link` keeps plugin code linked to your local workspace (good for local development).
+- If already installed, uninstall first: `openclaw plugins uninstall whisplay-im --force`.
+- If needed, explicitly enable plugin: `openclaw plugins enable whisplay-im`.
 
 ### 1.2) Multi-device / multi-account `accounts` example
 
@@ -78,19 +43,16 @@ If you connect multiple Whisplay devices, configure multiple account ids under `
 			"enabled": true,
 			"accounts": {
 				"default": {
-					"name": "Default Device",
 					"ip": "192.168.1.50:18888",
 					"token": "",
 					"waitSec": 60
 				},
 				"home": {
-					"name": "Home",
 					"ip": "192.168.1.51:18888",
 					"token": "home-token",
 					"waitSec": 25
 				},
 				"office": {
-					"name": "Office",
 					"ip": "10.0.10.20:18888",
 					"token": "office-token",
 					"waitSec": 20
@@ -105,9 +67,52 @@ Notes:
 
 - `default` is recommended as the primary account id.
 - Account ids (`default`, `home`, `office`) become runtime account identifiers in channel status/logs.
-- `accounts.<id>.name` is used in Chat conversation labels (for example: `whisplay (Office)`).
 - You can use any stable id names; avoid spaces and keep them short.
 - No top-level device fallback: every active account must define its own `ip`.
+
+### 2) Configure `openclaw.json`
+
+Use this as a complete example for `~/.openclaw/openclaw.json` (focused on `whisplay-im` related settings):
+
+```json
+{
+	"channels": {
+		"whisplay-im": {
+			"enabled": true,
+			"accounts": {
+				"default": {
+					"ip": "192.168.1.50:18888",
+					"token": "",
+					"waitSec": 60
+				}
+			}
+		}
+	}
+}
+```
+
+### 3) Restart gateway
+
+```bash
+openclaw gateway restart
+```
+
+### 4) Verify plugin is loaded
+
+```bash
+openclaw plugins info whisplay-im
+openclaw channels status
+```
+
+You should see `Whisplay IM` in configured/running channels.
+
+## Uninstall
+
+### 1) Uninstall plugin
+
+```bash
+openclaw plugins uninstall whisplay-im --force
+```
 
 ### 2) Restart gateway
 
@@ -115,13 +120,9 @@ Notes:
 openclaw gateway restart
 ```
 
-### 3) Verify plugin is loaded
+### 3) (Optional) Remove channel config
 
-```bash
-openclaw channels status
-```
-
-You should see `Whisplay IM` in configured/running channels.
+Delete `channels.whisplay-im` from `~/.openclaw/openclaw.json` if you no longer use this channel.
 
 ## OpenClaw Page Configuration
 
@@ -144,7 +145,7 @@ Minimum required structure:
 }
 ```
 
-Optional per-account fields: `name`, `token`, `waitSec` (default `60`), `enabled`.
+Optional per-account fields: `token`, `waitSec` (default `60`), `enabled`.
 
 ## Local Debugging
 

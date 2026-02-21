@@ -95,7 +95,7 @@ async function resolveGetReplyFromConfigFn() {
 
     throw new Error(
         `plugin-sdk getReplyFromConfig export is unavailable ` +
-            `(inspected=${diagnostics.join("|")})`,
+        `(inspected=${diagnostics.join("|")})`,
     );
 }
 
@@ -398,7 +398,7 @@ function extractPairingAlerts(logText, options = {}) {
 function resolveAccountSection(cfg, accountId) {
     const section = cfg?.channels?.[CHANNEL_ID] ?? {};
     const accountKey = accountId ?? "default";
-    const accounts = section?.accounts && typeof section.accounts === "object" ? section.accounts : {};
+    const accounts = normalizeAccountsConfig(section?.accounts);
     const accountSection = accounts[accountKey] && typeof accounts[accountKey] === "object" ? accounts[accountKey] : {};
     const hasLegacyTopLevelDeviceConfig =
         typeof section?.ip === "string" ||
@@ -413,10 +413,36 @@ function resolveAccountSection(cfg, accountId) {
     };
 }
 
+function normalizeAccountsConfig(accountsValue) {
+    if (!accountsValue) {
+        return {};
+    }
+
+    if (Array.isArray(accountsValue)) {
+        const normalized = {};
+        for (let index = 0; index < accountsValue.length; index += 1) {
+            const entry = accountsValue[index];
+            if (!entry || typeof entry !== "object") {
+                continue;
+            }
+            const rawId = typeof entry.id === "string" ? entry.id.trim() : "";
+            const fallbackId = index === 0 ? "default" : `account-${index + 1}`;
+            const id = rawId || fallbackId;
+            normalized[id] = {
+                ...entry,
+                id,
+            };
+        }
+        return normalized;
+    }
+
+    return typeof accountsValue === "object" ? accountsValue : {};
+}
+
 function buildAccountConfigError(accountId, account) {
     const prefix = `whisplay-im account "${accountId}" is not configured`;
     const guidance =
-        `Configure channels.${CHANNEL_ID}.accounts.${accountId}.ip (and optional token/waitSec/name). ` +
+        `Configure channels.${CHANNEL_ID}.accounts.${accountId}.ip (and optional token/waitSec). ` +
         `Top-level channels.${CHANNEL_ID}.ip/token/waitSec are not supported.`;
     if (account?.hasLegacyTopLevelDeviceConfig) {
         return `${prefix}: detected legacy top-level device fields. ${guidance}`;
@@ -507,8 +533,7 @@ function normalizeInboundItems(payload) {
 async function emitInboundToGateway(ctx, inbound) {
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
-    const accountName = toCleanText(ctx.account?.name);
-    const senderName = accountName ? `${peer.name} (${accountName})` : peer.name;
+    const senderName = `${peer.name}(${toCleanText(ctx.account?.id) || "unknown"})`;
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
     const peerKey = sanitizeSessionPart(senderId || inbound.id || "unknown") || "unknown";
@@ -620,8 +645,18 @@ const whisplayImChannel = {
             properties: {
                 enabled: { type: "boolean" },
                 accounts: {
-                    type: "object",
-                    additionalProperties: true
+                    type: "array",
+                    items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            id: { type: "string" },
+                            enabled: { type: "boolean" },
+                            ip: { type: "string" },
+                            token: { type: "string" },
+                            waitSec: { type: "number" },
+                        },
+                    },
                 }
             }
         }
@@ -629,13 +664,13 @@ const whisplayImChannel = {
     config: {
         listAccountIds: (cfg) => {
             const section = cfg?.channels?.[CHANNEL_ID] ?? {};
-            const accounts = section?.accounts && typeof section.accounts === "object" ? section.accounts : {};
+            const accounts = normalizeAccountsConfig(section?.accounts);
             const keys = Object.keys(accounts).filter(Boolean);
             return keys.length > 0 ? keys : ["default"];
         },
         defaultAccountId: (cfg) => {
             const section = cfg?.channels?.[CHANNEL_ID] ?? {};
-            const accounts = section?.accounts && typeof section.accounts === "object" ? section.accounts : {};
+            const accounts = normalizeAccountsConfig(section?.accounts);
             return Object.prototype.hasOwnProperty.call(accounts, "default")
                 ? "default"
                 : (Object.keys(accounts)[0] ?? "default");
@@ -644,7 +679,6 @@ const whisplayImChannel = {
             const effective = resolveAccountSection(cfg, accountId);
             return {
                 accountId: effective.accountId,
-                name: typeof effective?.name === "string" ? effective.name : "",
                 enabled: effective?.enabled !== false,
                 ip: typeof effective?.ip === "string" ? effective.ip : "",
                 token: typeof effective?.token === "string" ? effective.token : "",
@@ -661,7 +695,6 @@ const whisplayImChannel = {
         isConfigured: (account) => Boolean(account?.configured),
         describeAccount: (account) => ({
             accountId: account?.accountId ?? "default",
-            name: account?.name ? String(account.name) : "",
             enabled: account?.enabled !== false,
             configured: Boolean(account?.configured),
             ip: account?.ip ? "[set]" : "[missing]",
