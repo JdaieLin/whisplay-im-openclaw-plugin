@@ -1,29 +1,6 @@
 {
   "name": "whisplay-im",
   "displayName": "Whisplay IM",
-  "description": "HTTP bridge channel for Whisplay IM chatbot",
-  "config": [
-    {
-      "key": "ip",
-      "label": "Bridge IP/Host",
-      "type": "string",
-      "required": true,
-      "placeholder": "192.168.1.100:18888"
-    },
-    {
-      "key": "token",
-      "label": "Token (Optional)",
-      "type": "string",
-      "required": false,
-      "secret": true,
-      "placeholder": "your bearer token"
-    },
-    {
-      "key": "waitSec",
-      "label": "Poll waitSec",
-      "type": "number",
-      "required": false,
-      "default": 30
-    }
-  ]
+  "description": "HTTP bridge channel for Whisplay IM chatbot (configure devices in channels.whisplay-im.accounts)",
+  "config": []
 }

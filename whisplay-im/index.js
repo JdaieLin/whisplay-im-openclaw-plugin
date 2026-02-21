@@ -388,15 +388,30 @@ function extractPairingAlerts(logText, options = {}) {
 function resolveAccountSection(cfg, accountId) {
     const section = cfg?.channels?.[CHANNEL_ID] ?? {};
     const accountKey = accountId ?? "default";
-    const accountSection =
-        section?.accounts && typeof section.accounts === "object" && section.accounts[accountKey]
-            ? section.accounts[accountKey]
-            : {};
+    const accounts = section?.accounts && typeof section.accounts === "object" ? section.accounts : {};
+    const accountSection = accounts[accountKey] && typeof accounts[accountKey] === "object" ? accounts[accountKey] : {};
+    const hasLegacyTopLevelDeviceConfig =
+        typeof section?.ip === "string" ||
+        typeof section?.token === "string" ||
+        typeof section?.waitSec === "number";
     return {
-        ...section,
+        enabled: section?.enabled !== false,
         ...(accountSection && typeof accountSection === "object" ? accountSection : {}),
         accountId: accountKey,
+        hasAccountSection: Boolean(accountSection && typeof accountSection === "object" && Object.keys(accountSection).length > 0),
+        hasLegacyTopLevelDeviceConfig,
     };
+}
+
+function buildAccountConfigError(accountId, account) {
+    const prefix = `whisplay-im account "${accountId}" is not configured`;
+    const guidance =
+        `Configure channels.${CHANNEL_ID}.accounts.${accountId}.ip (and optional token/waitSec/name). ` +
+        `Top-level channels.${CHANNEL_ID}.ip/token/waitSec are not supported.`;
+    if (account?.hasLegacyTopLevelDeviceConfig) {
+        return `${prefix}: detected legacy top-level device fields. ${guidance}`;
+    }
+    return `${prefix}: missing accounts.${accountId}.ip. ${guidance}`;
 }
 
 function normalizeBaseUrl(ip) {
@@ -594,22 +609,9 @@ const whisplayImChannel = {
             additionalProperties: false,
             properties: {
                 enabled: { type: "boolean" },
-                ip: { type: "string" },
-                token: { type: "string" },
-                waitSec: { type: "integer" },
                 accounts: {
                     type: "object",
-                    additionalProperties: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                            name: { type: "string" },
-                            enabled: { type: "boolean" },
-                            ip: { type: "string" },
-                            token: { type: "string" },
-                            waitSec: { type: "integer" }
-                        }
-                    }
+                    additionalProperties: true
                 }
             }
         }
@@ -639,8 +641,11 @@ const whisplayImChannel = {
                 waitSec:
                     typeof effective?.waitSec === "number" && Number.isFinite(effective.waitSec)
                         ? effective.waitSec
-                        : 30,
-                configured: typeof effective?.ip === "string" && effective.ip.trim().length > 0,
+                        : 60,
+                configured:
+                    effective?.hasAccountSection === true &&
+                    typeof effective?.ip === "string" &&
+                    effective.ip.trim().length > 0,
             };
         },
         isConfigured: (account) => Boolean(account?.configured),
@@ -651,7 +656,7 @@ const whisplayImChannel = {
             configured: Boolean(account?.configured),
             ip: account?.ip ? "[set]" : "[missing]",
             token: account?.token ? "[set]" : "[empty]",
-            waitSec: account?.waitSec ?? 30,
+            waitSec: account?.waitSec ?? 60,
         }),
     },
     messaging: {
@@ -673,7 +678,7 @@ const whisplayImChannel = {
             const account = resolveAccountSection(cfg, accountId);
             const baseUrl = normalizeBaseUrl(account.ip);
             if (!baseUrl) {
-                throw new Error("whisplay-im is not configured: missing ip");
+                throw new Error(buildAccountConfigError(account.accountId ?? accountId ?? "default", account));
             }
 
             return sendReply(baseUrl, account.token, text);
@@ -720,7 +725,7 @@ const whisplayImChannel = {
             const account = resolveAccountSection(ctx.cfg, ctx.accountId);
             const baseUrl = normalizeBaseUrl(account.ip);
             if (!baseUrl) {
-                throw new Error("whisplay-im is not configured: missing ip");
+                throw new Error(buildAccountConfigError(ctx.accountId, account));
             }
 
             const isAborted = () => Boolean(ctx.abortSignal && ctx.abortSignal.aborted);
@@ -762,7 +767,7 @@ const whisplayImChannel = {
                         const waitSec =
                             typeof account.waitSec === "number" && Number.isFinite(account.waitSec)
                                 ? account.waitSec
-                                : 30;
+                                : 60;
                         const requestInit = {
                             method: "GET",
                             headers: buildHeaders(account.token),

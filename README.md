@@ -9,7 +9,7 @@
 ## Contents
 
 - `whisplay-im/index.js`: OpenClaw channel plugin implementation
-- `whisplay-im/openclaw.channel.json`: OpenClaw config page field definitions (`ip`, `token`, `waitSec`)
+- `whisplay-im/openclaw.channel.json`: OpenClaw channel metadata
 - `whisplay-im/openclaw.plugin.json`: plugin metadata
 - `whisplay-im/SKILL.md`: protocol contract
 
@@ -50,7 +50,7 @@ Use this as a complete, copy-ready example for `~/.openclaw/openclaw.json` (focu
 				"default": {
 					"ip": "192.168.1.50:18888",
 					"token": "",
-					"waitSec": 30
+					"waitSec": 60
 				}
 			}
 		}
@@ -64,25 +64,8 @@ Notes:
 - `ip` supports both `host:port` and `http://host:port`.
 - Keep `token` as empty string if your device API does not require auth.
 - `accounts.default` should match the account id used by channel runtime status.
-
-### 1.1.1) Single-device shorthand (also valid)
-
-If you only use one device, the following config is valid and supported:
-
-```json
-{
-	"channels": {
-		"whisplay-im": {
-			"ip": "192.168.100.93:18888",
-			"waitSec": 60,
-			"enabled": true,
-			"accounts": {}
-		}
-	}
-}
-```
-
-This shorthand maps to runtime account `default`.
+- Device settings must be configured under `accounts.<id>` only.
+- Top-level `channels.whisplay-im.ip/token/waitSec` is deprecated and not supported.
 
 ### 1.2) Multi-device / multi-account `accounts` example
 
@@ -98,7 +81,7 @@ If you connect multiple Whisplay devices, configure multiple account ids under `
 					"name": "Default Device",
 					"ip": "192.168.1.50:18888",
 					"token": "",
-					"waitSec": 30
+					"waitSec": 60
 				},
 				"home": {
 					"name": "Home",
@@ -124,7 +107,7 @@ Notes:
 - Account ids (`default`, `home`, `office`) become runtime account identifiers in channel status/logs.
 - `accounts.<id>.name` is used in Chat conversation labels (for example: `whisplay (Office)`).
 - You can use any stable id names; avoid spaces and keep them short.
-- Field precedence: for account `X`, values under `accounts.X` override top-level channel fields; if `accounts.X` is missing, top-level fields are used.
+- No top-level device fallback: every active account must define its own `ip`.
 
 ### 2) Restart gateway
 
@@ -142,17 +125,26 @@ You should see `Whisplay IM` in configured/running channels.
 
 ## OpenClaw Page Configuration
 
-Fill in the following fields on the OpenClaw channel config page:
+Configure channel accounts in `~/.openclaw/openclaw.json` under `channels.whisplay-im.accounts`.
 
-- `ip` (required): Whisplay device address, supports `host:port` or `http://host:port`
-- `token` (optional): Bearer token
-- `waitSec` (optional, default: 30): polling wait time in seconds
+Minimum required structure:
 
-Example:
+```json
+{
+	"channels": {
+		"whisplay-im": {
+			"enabled": true,
+			"accounts": {
+				"default": {
+					"ip": "192.168.1.50:18888"
+				}
+			}
+		}
+	}
+}
+```
 
-- `ip`: `192.168.1.50:18888`
-- `token`: leave empty or set to `xxxx`
-- `waitSec`: `30`
+Optional per-account fields: `name`, `token`, `waitSec` (default `60`), `enabled`.
 
 ## Local Debugging
 
@@ -161,7 +153,7 @@ Example:
 ```bash
 curl -X GET \
 	-H "Authorization: Bearer <token>" \
-	"http://<device-host>:18888/whisplay-im/poll?waitSec=30"
+	"http://<device-host>:18888/whisplay-im/poll?waitSec=60"
 ```
 
 ### 2) Send reply messages
