@@ -260,10 +260,20 @@ function rememberInboundKey(seen, value) {
 }
 
 function buildInboundDedupeKey(inbound) {
+    const peer = resolveInboundPeer(inbound);
+    const peerPart = peer?.id ? `peer:${peer.id}` : "";
     const idPart = inbound.id ? `id:${inbound.id}` : "";
+    if (idPart) {
+        return [idPart, peerPart].filter(Boolean).join("|");
+    }
+
     const tsPart = inbound.timestamp ? `ts:${inbound.timestamp}` : "";
-    const textPart = `text:${String(inbound.text ?? "").trim()}`;
-    return [idPart, tsPart, textPart].filter(Boolean).join("|");
+    if (tsPart) {
+        const textPart = `text:${String(inbound.text ?? "").trim()}`;
+        return [tsPart, peerPart, textPart].filter(Boolean).join("|");
+    }
+
+    return "";
 }
 
 function nextPollTick(accountId) {
@@ -794,6 +804,9 @@ const whisplayImChannel = {
                             for (const inbound of inbounds) {
                                 const dedupeKey = buildInboundDedupeKey(inbound);
                                 if (dedupeKey && seen.has(dedupeKey)) {
+                                    ctx.log?.warn?.(
+                                        `[${ctx.accountId}] inbound dropped as duplicate: ${dedupeKey}`,
+                                    );
                                     continue;
                                 }
                                 const methodName = await emitInboundToGateway(ctx, inbound);
