@@ -29,7 +29,12 @@ async function resolvePluginSdkIndexPath() {
         "/home/linuxbrew/.linuxbrew/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
     ];
 
-    const openclawBinCandidates = ["/opt/homebrew/bin/openclaw", "/usr/local/bin/openclaw", "/opt/local/bin/openclaw"];
+    const openclawBinCandidates = [
+        "/opt/homebrew/bin/openclaw",
+        "/usr/local/bin/openclaw",
+        "/opt/local/bin/openclaw",
+        "/home/linuxbrew/.linuxbrew/bin/openclaw",
+    ];
     for (const binPath of openclawBinCandidates) {
         try {
             const realBin = await fs.realpath(binPath);
