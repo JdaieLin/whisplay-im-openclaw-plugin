@@ -26,6 +26,7 @@ async function resolvePluginSdkIndexPath() {
     const candidates = [
         "/opt/homebrew/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
         "/usr/local/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
+        "/home/linuxbrew/.linuxbrew/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
     ];
 
     const openclawBinCandidates = ["/opt/homebrew/bin/openclaw", "/usr/local/bin/openclaw", "/opt/local/bin/openclaw"];
