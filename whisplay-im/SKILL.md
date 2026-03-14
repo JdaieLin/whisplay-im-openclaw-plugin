@@ -45,7 +45,19 @@ curl -X POST \
   http://<device-host>:18888/whisplay-im/send
 ```
 
+### Send reply with image to device
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"reply":"Here is what I made","emoji":"🎨","imageBase64":"data:image/png;base64,iVBOR..."}' \
+  http://<device-host>:18888/whisplay-im/send
+```
+
 ## Notes
 
 - `poll` returns an empty payload when no message is available.
-- `send` supports optional `emoji`.
+- `send` supports optional `emoji` and `imageBase64`.
+- Image messages from the device include `imageBase64` in the poll response.
+- All images are transmitted as base64 data URLs.

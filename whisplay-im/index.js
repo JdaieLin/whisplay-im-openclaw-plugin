@@ -470,16 +470,36 @@ function buildHeaders(token) {
     return headers;
 }
 
-async function sendReply(baseUrl, token, reply) {
+async function fetchImageAsBase64(url) {
+    if (!url) return "";
+    // Already a data URL
+    if (url.startsWith("data:")) return url;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) return "";
+        const contentType = response.headers.get("content-type") || "image/jpeg";
+        const buffer = await response.arrayBuffer();
+        const base64 = Buffer.from(buffer).toString("base64");
+        return `data:${contentType};base64,${base64}`;
+    } catch (err) {
+        return "";
+    }
+}
+
+async function sendReply(baseUrl, token, reply, imageBase64) {
+    const body = { reply, emoji: "🦞" };
+    if (imageBase64) {
+        body.imageBase64 = imageBase64;
+    }
     const response = await fetch(`${baseUrl}/whisplay-im/send`, {
         method: "POST",
         headers: buildHeaders(token),
-        body: JSON.stringify({ reply, emoji: "🦞" }),
+        body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        throw new Error(`whisplay-im send failed: HTTP ${response.status}${body ? ` ${body}` : ""}`);
+        const respBody = await response.text().catch(() => "");
+        throw new Error(`whisplay-im send failed: HTTP ${response.status}${respBody ? ` ${respBody}` : ""}`);
     }
 
     return { ok: true, channel: CHANNEL_ID };
@@ -490,6 +510,7 @@ function normalizeInboundItems(payload) {
         return [];
     }
 
+    const topLevelImageBase64 = typeof payload.imageBase64 === "string" ? payload.imageBase64.trim() : "";
     const results = [];
     const list = Array.isArray(payload.messages) ? payload.messages : [];
 
@@ -507,8 +528,10 @@ function normalizeInboundItems(payload) {
             if (!text.trim()) {
                 continue;
             }
+            const itemImageBase64 = typeof item.imageBase64 === "string" ? item.imageBase64.trim() : "";
             results.push({
                 text,
+                imageBase64: itemImageBase64 || topLevelImageBase64,
                 id:
                     typeof item.id === "string" || typeof item.id === "number"
                         ? String(item.id)
@@ -525,7 +548,7 @@ function normalizeInboundItems(payload) {
 
     const single = typeof payload.message === "string" ? payload.message : "";
     if (single.trim()) {
-        results.push({ text: single, id: "", timestamp: "", raw: payload });
+        results.push({ text: single, imageBase64: topLevelImageBase64, id: "", timestamp: "", raw: payload });
     }
     return results;
 }
@@ -560,6 +583,7 @@ async function emitInboundToGateway(ctx, inbound) {
         OriginatingChannel: CHANNEL_ID,
         OriginatingTo: senderId || undefined,
         CommandAuthorized: true,
+        ...(inbound.imageBase64 ? { MediaUrl: inbound.imageBase64 } : {}),
     };
 
     const getReplyFromConfig = await loadGetReplyFromConfig();
@@ -567,11 +591,24 @@ async function emitInboundToGateway(ctx, inbound) {
     const replies = normalizeReplyPayloads(replyPayload);
     let sentCount = 0;
     for (const payload of replies) {
-        const text = payloadToReplyText(payload);
-        if (!text) {
+        const text = String(payload?.text ?? "").trim();
+        const mediaUrl = String(payload?.mediaUrl ?? "").trim();
+        const mediaUrls = Array.isArray(payload?.mediaUrls)
+            ? payload.mediaUrls.map((v) => String(v ?? "").trim()).filter(Boolean)
+            : [];
+        const firstMediaUrl = mediaUrl || (mediaUrls.length > 0 ? mediaUrls[0] : "");
+        const replyText = text || (firstMediaUrl ? "" : payloadToReplyText(payload));
+
+        // Convert media URL to base64 if present
+        let imageBase64 = "";
+        if (firstMediaUrl) {
+            imageBase64 = await fetchImageAsBase64(firstMediaUrl);
+        }
+
+        if (!replyText && !imageBase64) {
             continue;
         }
-        await sendReply(normalizeBaseUrl(ctx.account?.ip), ctx.account?.token, text);
+        await sendReply(normalizeBaseUrl(ctx.account?.ip), ctx.account?.token, replyText, imageBase64 || undefined);
         sentCount += 1;
     }
     if (sentCount > 0) {
@@ -634,7 +671,7 @@ const whisplayImChannel = {
         chatTypes: ["direct"],
         reactions: false,
         threads: false,
-        media: false,
+        media: true,
         nativeCommands: false,
         blockStreaming: true,
     },
@@ -725,18 +762,29 @@ const whisplayImChannel = {
                 throw new Error(buildAccountConfigError(account.accountId ?? accountId ?? "default", account));
             }
 
-            return sendReply(baseUrl, account.token, text);
+            return sendReply(baseUrl, account.token, text, undefined);
         },
-        sendMedia: async ({ cfg, accountId, text, mediaUrl }) => {
+        sendMedia: async ({ cfg, accountId, text, mediaUrl, mediaUrls }) => {
             const caption = String(text ?? "").trim();
             const media = String(mediaUrl ?? "").trim();
-            const composed = media ? (caption ? `${caption}\n\n${media}` : media) : caption;
-            const result = await whisplayImChannel.outbound.sendText({
-                cfg,
-                accountId,
-                text: composed,
-            });
-            return result;
+            const mediaList = Array.isArray(mediaUrls)
+                ? mediaUrls.map((v) => String(v ?? "").trim()).filter(Boolean)
+                : [];
+            const firstMediaUrl = media || (mediaList.length > 0 ? mediaList[0] : "");
+
+            const account = resolveAccountSection(cfg, accountId);
+            const baseUrl = normalizeBaseUrl(account.ip);
+            if (!baseUrl) {
+                throw new Error(buildAccountConfigError(account.accountId ?? accountId ?? "default", account));
+            }
+
+            // Convert media URL to base64 for transmission
+            let imageBase64 = "";
+            if (firstMediaUrl) {
+                imageBase64 = await fetchImageAsBase64(firstMediaUrl);
+            }
+
+            return sendReply(baseUrl, account.token, caption, imageBase64 || undefined);
         },
     },
     status: {
