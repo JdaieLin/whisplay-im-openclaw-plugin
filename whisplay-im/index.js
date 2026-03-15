@@ -1,5 +1,8 @@
 import { promises as fs } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
 
 const CHANNEL_ID = "whisplay-im";
@@ -54,26 +57,40 @@ async function resolvePluginSdkReplyBundlePath() {
     const indexPath = await resolvePluginSdkIndexPath();
     const sdkDir = path.dirname(indexPath);
     const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-    const candidates = entries
-        .filter((entry) => entry.isFile() && /^reply-.*\.js$/.test(entry.name))
-        .map((entry) => path.join(sdkDir, entry.name))
-        .sort();
-
-    if (candidates.length === 0) {
-        throw new Error(`no reply bundle found under plugin-sdk dir: ${sdkDir}`);
+    // Try reply-*.js first, then thread-bindings-*.js (new SDK layout)
+    const patterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
+    for (const pattern of patterns) {
+        const candidates = entries
+            .filter((entry) => entry.isFile() && pattern.test(entry.name))
+            .map((entry) => path.join(sdkDir, entry.name))
+            .sort();
+        if (candidates.length > 0) return candidates[0];
     }
 
-    return candidates[0];
+    throw new Error(`no reply bundle found under plugin-sdk dir: ${sdkDir}`);
 }
 
 async function resolveGetReplyFromConfigFn() {
     const indexPath = await resolvePluginSdkIndexPath();
     const sdkDir = path.dirname(indexPath);
     const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-    const candidates = entries
-        .filter((entry) => entry.isFile() && /^reply-.*\.js$/.test(entry.name))
-        .map((entry) => path.join(sdkDir, entry.name))
-        .sort();
+
+    // Search reply-*.js first (legacy), then thread-bindings-*.js (new SDK layout),
+    // then any remaining .js bundles as fallback.
+    const priorityPatterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
+    const priorityCandidates = [];
+    const fallbackCandidates = [];
+    for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith(".js")) continue;
+        const isPriority = priorityPatterns.some((re) => re.test(entry.name));
+        const fullPath = path.join(sdkDir, entry.name);
+        if (isPriority) {
+            priorityCandidates.push(fullPath);
+        } else {
+            fallbackCandidates.push(fullPath);
+        }
+    }
+    const candidates = [...priorityCandidates.sort(), ...fallbackCandidates.sort()];
 
     const diagnostics = [];
     for (const candidate of candidates) {
@@ -486,25 +503,96 @@ async function fetchImageAsBase64(url) {
     }
 }
 
+// --- Gateway log watcher for agent tool events ---
+
+function resolveGatewayLogPath() {
+    const tmpDir = os.tmpdir();
+    const uid = process.getuid?.() ?? 502;
+    const logDir = path.join(tmpDir, `openclaw-${uid}`);
+    const today = new Date().toISOString().slice(0, 10);
+    return path.join(logDir, `openclaw-${today}.log`);
+}
+
+function createLogWatcher(onToolEvent) {
+    const logPath = resolveGatewayLogPath();
+    let fileSize = 0;
+    try { fileSize = statSync(logPath).size; } catch { return { stop() {} }; }
+    let stopped = false;
+    let timer = null;
+
+    const poll = async () => {
+        if (stopped) return;
+        try {
+            const currentSize = statSync(logPath).size;
+            if (currentSize <= fileSize) {
+                return;
+            }
+            const bytesToRead = currentSize - fileSize;
+            console.warn(`[logWatcher] new data: ${bytesToRead} bytes (offset ${fileSize}→${currentSize})`);
+            const stream = createReadStream(logPath, { start: fileSize, encoding: "utf8" });
+            const rl = createInterface({ input: stream, crlfDelay: Infinity });
+            fileSize = currentSize;
+            for await (const line of rl) {
+                if (stopped) break;
+                try {
+                    const obj = JSON.parse(line);
+                    const msg = obj?.["1"] || "";
+                    if (msg.includes("embedded run")) {
+                        console.warn(`[logWatcher] matched embedded run line: ${msg.slice(0, 100)}`);
+                    }
+                    const toolStartMatch = msg.match(/^embedded run tool start:.*tool=(\S+)/);
+                    if (toolStartMatch) {
+                        console.warn(`[logWatcher] TOOL START: ${toolStartMatch[1]}`);
+                        onToolEvent({ phase: "start", tool: toolStartMatch[1] });
+                        continue;
+                    }
+                    const toolEndMatch = msg.match(/^embedded run tool end:.*tool=(\S+)/);
+                    if (toolEndMatch) {
+                        console.warn(`[logWatcher] TOOL END: ${toolEndMatch[1]}`);
+                        onToolEvent({ phase: "end", tool: toolEndMatch[1] });
+                        continue;
+                    }
+                } catch {}
+            }
+        } catch (err) {
+            console.warn(`[logWatcher] poll error: ${err?.message ?? err}`);
+        }
+    };
+
+    timer = setInterval(poll, 600);
+    poll(); // initial poll
+
+    return {
+        stop() {
+            stopped = true;
+            if (timer) clearInterval(timer);
+        },
+    };
+}
+
 async function sendStatus(baseUrl, token, status, extra = {}) {
     const body = { status, ...extra };
+    const url = `${baseUrl}/whisplay-im/status`;
+    console.warn(`[sendStatus] POST ${url} status=${status} ${extra.tool ? `tool=${extra.tool}` : ''} ${extra.emoji || ''}`);
     try {
-        const response = await fetch(`${baseUrl}/whisplay-im/status`, {
+        const response = await fetch(url, {
             method: "POST",
             headers: buildHeaders(token),
             body: JSON.stringify(body),
         });
         if (!response.ok) {
             const respBody = await response.text().catch(() => "");
-            console.warn(`whisplay-im sendStatus failed: HTTP ${response.status}${respBody ? ` ${respBody}` : ""}`);
+            console.warn(`[sendStatus] FAILED: HTTP ${response.status}${respBody ? ` ${respBody}` : ""}`);
+        } else {
+            console.warn(`[sendStatus] OK: ${response.status}`);
         }
     } catch (err) {
-        console.warn(`whisplay-im sendStatus error: ${err instanceof Error ? err.message : String(err)}`);
+        console.warn(`[sendStatus] ERROR: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
 
 async function sendReply(baseUrl, token, reply, imageBase64) {
-    const body = { reply, emoji: "🦞" };
+    const body = { reply, emoji: "😊" };
     if (imageBase64) {
         body.imageBase64 = imageBase64;
     }
@@ -611,7 +699,29 @@ async function emitInboundToGateway(ctx, inbound) {
     // Send "thinking" status before agent processes the message
     await sendStatus(baseUrl, accountToken, "thinking", { emoji: "🤔", text: inbound.text.slice(0, 80) });
 
-    const replyPayload = await getReplyFromConfig(inboundCtx, undefined, ctx.cfg);
+    // Start log watcher to detect tool events during agent execution
+    const logWatcher = createLogWatcher((evt) => {
+        if (evt.phase === "start") {
+            sendStatus(baseUrl, accountToken, "tool_calling", {
+                emoji: "🔧",
+                tool: evt.tool,
+                text: `Invoking ${evt.tool}...`,
+            }).catch(() => {});
+        } else if (evt.phase === "end") {
+            sendStatus(baseUrl, accountToken, "tool_calling", {
+                emoji: "✅",
+                tool: evt.tool,
+                text: `${evt.tool} done`,
+            }).catch(() => {});
+        }
+    });
+
+    let replyPayload;
+    try {
+        replyPayload = await getReplyFromConfig(inboundCtx, undefined, ctx.cfg);
+    } finally {
+        logWatcher.stop();
+    }
     const replies = normalizeReplyPayloads(replyPayload);
     let sentCount = 0;
     for (const payload of replies) {
@@ -622,17 +732,6 @@ async function emitInboundToGateway(ctx, inbound) {
             : [];
         const firstMediaUrl = mediaUrl || (mediaUrls.length > 0 ? mediaUrls[0] : "");
         const replyText = text || (firstMediaUrl ? "" : payloadToReplyText(payload));
-
-        // Detect tool call indicators in the reply payload
-        const toolName = String(payload?.toolName ?? payload?.tool ?? payload?.functionName ?? "").trim();
-        const toolResult = String(payload?.toolResult ?? payload?.result ?? "").trim();
-        if (toolName) {
-            await sendStatus(baseUrl, accountToken, "tool_calling", {
-                emoji: "🔧",
-                tool: toolName,
-                text: toolResult ? toolResult.slice(0, 120) : `Invoking ${toolName}...`,
-            });
-        }
 
         // Convert media URL to base64 if present
         let imageBase64 = "";
@@ -651,14 +750,14 @@ async function emitInboundToGateway(ctx, inbound) {
 
         // Send "answering" status before delivering the reply
         if (replyText) {
-            await sendStatus(baseUrl, accountToken, "answering", { emoji: "🦞" });
+            await sendStatus(baseUrl, accountToken, "answering");
         }
         await sendReply(baseUrl, accountToken, replyText, imageBase64 || undefined);
         sentCount += 1;
     }
 
     // Send "idle" status after all replies are delivered
-    await sendStatus(baseUrl, accountToken, "idle", { emoji: "🦞" });
+    await sendStatus(baseUrl, accountToken, "idle");
 
     if (sentCount > 0) {
         ctx.setStatus({
