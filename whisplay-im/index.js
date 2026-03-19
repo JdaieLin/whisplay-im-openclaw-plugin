@@ -503,64 +503,116 @@ async function fetchImageAsBase64(url) {
     }
 }
 
-// --- Gateway log watcher for agent tool events ---
+// --- Session transcript watcher for agent tool events ---
 
-function resolveGatewayLogPath() {
-    const tmpDir = os.tmpdir();
-    const uid = process.getuid?.() ?? 502;
-    const logDir = path.join(tmpDir, `openclaw-${uid}`);
-    const today = new Date().toISOString().slice(0, 10);
-    return path.join(logDir, `openclaw-${today}.log`);
-}
-
-function createLogWatcher(onToolEvent) {
-    const logPath = resolveGatewayLogPath();
+function createLogWatcher(sessionKey, onToolEvent) {
+    const sessionsDir = path.join(os.homedir(), ".openclaw", "agents", "main", "sessions");
+    const sessionsIndexPath = path.join(sessionsDir, "sessions.json");
+    let sessionFilePath = null;
     let fileSize = 0;
-    try { fileSize = statSync(logPath).size; } catch { return { stop() {} }; }
     let stopped = false;
     let timer = null;
+    const seenStartIds = new Set();
+    const seenEndIds = new Set();
+
+    async function resolveSessionFilePath() {
+        try {
+            const raw = await fs.readFile(sessionsIndexPath, "utf8");
+            const index = JSON.parse(raw);
+            const sessionEntry = index?.[sessionKey];
+            const configuredPath = typeof sessionEntry?.sessionFile === "string" ? sessionEntry.sessionFile.trim() : "";
+            if (!configuredPath) {
+                return null;
+            }
+            return path.isAbsolute(configuredPath)
+                ? configuredPath
+                : path.join(sessionsDir, configuredPath);
+        } catch {
+            return null;
+        }
+    }
+
+    async function ensureSessionFile() {
+        if (sessionFilePath) {
+            return sessionFilePath;
+        }
+
+        const candidate = await resolveSessionFilePath();
+        if (!candidate) {
+            return null;
+        }
+
+        try {
+            fileSize = statSync(candidate).size;
+            sessionFilePath = candidate;
+            return sessionFilePath;
+        } catch {
+            return null;
+        }
+    }
+
+    function handleRecord(record) {
+        const msg = record?.message;
+        if (!msg || typeof msg !== "object") {
+            return;
+        }
+
+        if (msg.role === "assistant" && Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+                if (!part || part.type !== "toolCall") {
+                    continue;
+                }
+                const tool = String(part.name || "tool").trim() || "tool";
+                const toolCallId = String(part.id || `${tool}:${record?.id || record?.timestamp || ""}`);
+                if (seenStartIds.has(toolCallId)) {
+                    continue;
+                }
+                seenStartIds.add(toolCallId);
+                onToolEvent({ phase: "start", tool, toolCallId });
+            }
+            return;
+        }
+
+        if (msg.role === "toolResult") {
+            const tool = String(msg.toolName || "tool").trim() || "tool";
+            const toolCallId = String(msg.toolCallId || `${tool}:${record?.id || record?.timestamp || ""}`);
+            if (seenEndIds.has(toolCallId)) {
+                return;
+            }
+            seenEndIds.add(toolCallId);
+            onToolEvent({ phase: "end", tool, toolCallId });
+        }
+    }
 
     const poll = async () => {
         if (stopped) return;
         try {
-            const currentSize = statSync(logPath).size;
+            const currentFile = await ensureSessionFile();
+            if (!currentFile) {
+                return;
+            }
+
+            const currentSize = statSync(currentFile).size;
             if (currentSize <= fileSize) {
                 return;
             }
-            const bytesToRead = currentSize - fileSize;
-            console.warn(`[logWatcher] new data: ${bytesToRead} bytes (offset ${fileSize}→${currentSize})`);
-            const stream = createReadStream(logPath, { start: fileSize, encoding: "utf8" });
+
+            const stream = createReadStream(currentFile, { start: fileSize, encoding: "utf8" });
             const rl = createInterface({ input: stream, crlfDelay: Infinity });
             fileSize = currentSize;
             for await (const line of rl) {
                 if (stopped) break;
                 try {
-                    const obj = JSON.parse(line);
-                    const msg = obj?.["1"] || "";
-                    if (msg.includes("embedded run")) {
-                        console.warn(`[logWatcher] matched embedded run line: ${msg.slice(0, 100)}`);
-                    }
-                    const toolStartMatch = msg.match(/^embedded run tool start:.*tool=(\S+)/);
-                    if (toolStartMatch) {
-                        console.warn(`[logWatcher] TOOL START: ${toolStartMatch[1]}`);
-                        onToolEvent({ phase: "start", tool: toolStartMatch[1] });
-                        continue;
-                    }
-                    const toolEndMatch = msg.match(/^embedded run tool end:.*tool=(\S+)/);
-                    if (toolEndMatch) {
-                        console.warn(`[logWatcher] TOOL END: ${toolEndMatch[1]}`);
-                        onToolEvent({ phase: "end", tool: toolEndMatch[1] });
-                        continue;
-                    }
+                    handleRecord(JSON.parse(line));
                 } catch {}
             }
         } catch (err) {
-            console.warn(`[logWatcher] poll error: ${err?.message ?? err}`);
+            console.warn(`[sessionWatcher] poll error: ${err?.message ?? err}`);
         }
     };
 
-    timer = setInterval(poll, 600);
-    poll(); // initial poll
+    timer = setInterval(poll, 300);
+    poll();
 
     return {
         stop() {
@@ -699,8 +751,8 @@ async function emitInboundToGateway(ctx, inbound) {
     // Send "thinking" status before agent processes the message
     await sendStatus(baseUrl, accountToken, "thinking", { emoji: "🤔", text: inbound.text.slice(0, 80) });
 
-    // Start log watcher to detect tool events during agent execution
-    const logWatcher = createLogWatcher((evt) => {
+    // Watch the OpenClaw session transcript so tool states do not depend on debug log formatting.
+    const logWatcher = createLogWatcher(sessionKey, (evt) => {
         if (evt.phase === "start") {
             sendStatus(baseUrl, accountToken, "tool_calling", {
                 emoji: "🔧",
