@@ -1,8 +1,5 @@
 import { promises as fs } from "node:fs";
-import { createReadStream, statSync } from "node:fs";
-import { createInterface } from "node:readline";
 import path from "node:path";
-import os from "node:os";
 import { pathToFileURL } from "node:url";
 
 const CHANNEL_ID = "whisplay-im";
@@ -14,7 +11,7 @@ const INBOUND_CACHE_LIMIT = 512;
 const pairingRelaySeen = new Map();
 const inboundSeenByAccount = new Map();
 const pollTickByAccount = new Map();
-let getReplyFromConfigLoader = null;
+let dispatchFnLoader = null;
 
 async function fileExists(filePath) {
     try {
@@ -59,74 +56,46 @@ async function resolvePluginSdkIndexPath() {
     );
 }
 
-async function resolvePluginSdkReplyBundlePath() {
-    const indexPath = await resolvePluginSdkIndexPath();
-    const sdkDir = path.dirname(indexPath);
-    const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-    // Try reply-*.js first, then thread-bindings-*.js (new SDK layout)
-    const patterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
-    for (const pattern of patterns) {
-        const candidates = entries
-            .filter((entry) => entry.isFile() && pattern.test(entry.name))
-            .map((entry) => path.join(sdkDir, entry.name))
-            .sort();
-        if (candidates.length > 0) return candidates[0];
+async function loadDispatchFn() {
+    if (!dispatchFnLoader) {
+        dispatchFnLoader = (async () => {
+            const indexPath = await resolvePluginSdkIndexPath();
+            const sdkModule = await import(pathToFileURL(indexPath).href);
+            const fn = sdkModule.dispatchReplyFromConfigWithSettledDispatcher;
+            if (typeof fn !== "function") {
+                throw new Error(
+                    `plugin-sdk: dispatchReplyFromConfigWithSettledDispatcher not found in ${indexPath}`,
+                );
+            }
+            return fn;
+        })();
     }
-
-    throw new Error(`no reply bundle found under plugin-sdk dir: ${sdkDir}`);
+    return dispatchFnLoader;
 }
 
-async function resolveGetReplyFromConfigFn() {
-    const indexPath = await resolvePluginSdkIndexPath();
-    const sdkDir = path.dirname(indexPath);
-    const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-
-    // Search reply-*.js first (legacy), then thread-bindings-*.js (new SDK layout),
-    // then any remaining .js bundles as fallback.
-    const priorityPatterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
-    const priorityCandidates = [];
-    const fallbackCandidates = [];
-    for (const entry of entries) {
-        if (!entry.isFile() || !entry.name.endsWith(".js")) continue;
-        const isPriority = priorityPatterns.some((re) => re.test(entry.name));
-        const fullPath = path.join(sdkDir, entry.name);
-        if (isPriority) {
-            priorityCandidates.push(fullPath);
-        } else {
-            fallbackCandidates.push(fullPath);
-        }
-    }
-    const candidates = [...priorityCandidates.sort(), ...fallbackCandidates.sort()];
-
-    const diagnostics = [];
-    for (const candidate of candidates) {
-        const replyModule = await import(pathToFileURL(candidate).href);
-        const byName = Object.values(replyModule).find(
-            (value) => typeof value === "function" && value.name === "getReplyFromConfig",
+// Build a dispatcher that delivers each reply payload sequentially to the whisplay device.
+function buildWhisplayDispatcher(deliverPayload) {
+    let chainedPromise = Promise.resolve();
+    const enqueue = (payload) => {
+        chainedPromise = chainedPromise.then(() =>
+            deliverPayload(payload).catch((err) => {
+                console.warn(
+                    `[whisplay-im] dispatcher delivery error: ${
+                        err instanceof Error ? err.message : String(err)
+                    }`,
+                );
+            }),
         );
-        const fnNames = Object.values(replyModule)
-            .filter((value) => typeof value === "function")
-            .map((value) => value.name)
-            .filter(Boolean)
-            .slice(0, 10)
-            .join(",");
-        diagnostics.push(`${path.basename(candidate)}:${fnNames}`);
-        if (typeof byName === "function") {
-            return byName;
-        }
-    }
-
-    throw new Error(
-        `plugin-sdk getReplyFromConfig export is unavailable ` +
-        `(inspected=${diagnostics.join("|")})`,
-    );
-}
-
-function normalizeReplyPayloads(payload) {
-    if (!payload) {
-        return [];
-    }
-    return Array.isArray(payload) ? payload.filter(Boolean) : [payload];
+        return true;
+    };
+    return {
+        sendToolResult: () => true,
+        sendBlockReply: enqueue,
+        sendFinalReply: enqueue,
+        waitForIdle: () => chainedPromise,
+        getQueuedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+        markComplete: () => {},
+    };
 }
 
 function payloadToReplyText(payload) {
@@ -245,26 +214,6 @@ function sanitizeSessionPart(value) {
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "")
         .slice(0, 96);
-}
-
-async function loadGetReplyFromConfig() {
-    if (!getReplyFromConfigLoader) {
-        getReplyFromConfigLoader = (async () => {
-            const resolvedByProbe = await resolveGetReplyFromConfigFn();
-            if (typeof resolvedByProbe === "function") {
-                return resolvedByProbe;
-            }
-
-            const replyBundlePath = await resolvePluginSdkReplyBundlePath();
-            const replyModule = await import(pathToFileURL(replyBundlePath).href);
-            if (typeof replyModule?.t === "function") {
-                return replyModule.t;
-            }
-
-            throw new Error("plugin-sdk getReplyFromConfig export is unavailable");
-        })();
-    }
-    return getReplyFromConfigLoader;
 }
 
 function getPairingSeenSet(accountId) {
@@ -546,125 +495,6 @@ async function fetchImageAsBase64(url) {
     }
 }
 
-// --- Session transcript watcher for agent tool events ---
-
-function createLogWatcher(sessionKey, onToolEvent) {
-    const sessionsDir = path.join(os.homedir(), ".openclaw", "agents", "main", "sessions");
-    const sessionsIndexPath = path.join(sessionsDir, "sessions.json");
-    let sessionFilePath = null;
-    let fileSize = 0;
-    let stopped = false;
-    let timer = null;
-    const seenStartIds = new Set();
-    const seenEndIds = new Set();
-
-    async function resolveSessionFilePath() {
-        try {
-            const raw = await fs.readFile(sessionsIndexPath, "utf8");
-            const index = JSON.parse(raw);
-            const sessionEntry = index?.[sessionKey];
-            const configuredPath = typeof sessionEntry?.sessionFile === "string" ? sessionEntry.sessionFile.trim() : "";
-            if (!configuredPath) {
-                return null;
-            }
-            return path.isAbsolute(configuredPath)
-                ? configuredPath
-                : path.join(sessionsDir, configuredPath);
-        } catch {
-            return null;
-        }
-    }
-
-    async function ensureSessionFile() {
-        if (sessionFilePath) {
-            return sessionFilePath;
-        }
-
-        const candidate = await resolveSessionFilePath();
-        if (!candidate) {
-            return null;
-        }
-
-        try {
-            fileSize = statSync(candidate).size;
-            sessionFilePath = candidate;
-            return sessionFilePath;
-        } catch {
-            return null;
-        }
-    }
-
-    function handleRecord(record) {
-        const msg = record?.message;
-        if (!msg || typeof msg !== "object") {
-            return;
-        }
-
-        if (msg.role === "assistant" && Array.isArray(msg.content)) {
-            for (const part of msg.content) {
-                if (!part || part.type !== "toolCall") {
-                    continue;
-                }
-                const tool = String(part.name || "tool").trim() || "tool";
-                const toolCallId = String(part.id || `${tool}:${record?.id || record?.timestamp || ""}`);
-                if (seenStartIds.has(toolCallId)) {
-                    continue;
-                }
-                seenStartIds.add(toolCallId);
-                onToolEvent({ phase: "start", tool, toolCallId });
-            }
-            return;
-        }
-
-        if (msg.role === "toolResult") {
-            const tool = String(msg.toolName || "tool").trim() || "tool";
-            const toolCallId = String(msg.toolCallId || `${tool}:${record?.id || record?.timestamp || ""}`);
-            if (seenEndIds.has(toolCallId)) {
-                return;
-            }
-            seenEndIds.add(toolCallId);
-            onToolEvent({ phase: "end", tool, toolCallId });
-        }
-    }
-
-    const poll = async () => {
-        if (stopped) return;
-        try {
-            const currentFile = await ensureSessionFile();
-            if (!currentFile) {
-                return;
-            }
-
-            const currentSize = statSync(currentFile).size;
-            if (currentSize <= fileSize) {
-                return;
-            }
-
-            const stream = createReadStream(currentFile, { start: fileSize, encoding: "utf8" });
-            const rl = createInterface({ input: stream, crlfDelay: Infinity });
-            fileSize = currentSize;
-            for await (const line of rl) {
-                if (stopped) break;
-                try {
-                    handleRecord(JSON.parse(line));
-                } catch {}
-            }
-        } catch (err) {
-            console.warn(`[sessionWatcher] poll error: ${err?.message ?? err}`);
-        }
-    };
-
-    timer = setInterval(poll, 300);
-    poll();
-
-    return {
-        stop() {
-            stopped = true;
-            if (timer) clearInterval(timer);
-        },
-    };
-}
-
 async function sendStatus(baseUrl, token, status, extra = {}) {
     const body = { status, ...extra };
     const url = `${baseUrl}/whisplay-im/status`;
@@ -797,37 +627,15 @@ async function emitInboundToGateway(ctx, inbound) {
     const baseUrl = normalizeBaseUrl(ctx.account?.ip);
     const accountToken = ctx.account?.token;
 
-    const getReplyFromConfig = await loadGetReplyFromConfig();
+    const dispatchFn = await loadDispatchFn();
 
     // Send "thinking" status before agent processes the message
     await sendStatus(baseUrl, accountToken, "thinking", { emoji: "🤔", text: sanitizedInbound.text.slice(0, 80) });
 
-    // Watch the OpenClaw session transcript so tool states do not depend on debug log formatting.
-    const logWatcher = createLogWatcher(sessionKey, (evt) => {
-        if (evt.phase === "start") {
-            sendStatus(baseUrl, accountToken, "tool_calling", {
-                emoji: "🔧",
-                tool: evt.tool,
-                text: `Invoking ${evt.tool}...`,
-            }).catch(() => {});
-        } else if (evt.phase === "end") {
-            sendStatus(baseUrl, accountToken, "tool_calling", {
-                emoji: "✅",
-                tool: evt.tool,
-                text: `${evt.tool} done`,
-            }).catch(() => {});
-        }
-    });
-
-    let replyPayload;
-    try {
-        replyPayload = await getReplyFromConfig(inboundCtx, undefined, ctx.cfg);
-    } finally {
-        logWatcher.stop();
-    }
-    const replies = normalizeReplyPayloads(replyPayload);
     let sentCount = 0;
-    for (const payload of replies) {
+
+    // Build a sequential dispatcher that sends each reply to the whisplay device.
+    const dispatcher = buildWhisplayDispatcher(async (payload) => {
         const text = String(payload?.text ?? "").trim();
         const mediaUrl = String(payload?.mediaUrl ?? "").trim();
         const mediaUrls = Array.isArray(payload?.mediaUrls)
@@ -848,7 +656,7 @@ async function emitInboundToGateway(ctx, inbound) {
         }
 
         if (!replyText && !imageBase64) {
-            continue;
+            return;
         }
 
         // Send "answering" status before delivering the reply
@@ -857,10 +665,34 @@ async function emitInboundToGateway(ctx, inbound) {
         }
         await sendReply(baseUrl, accountToken, replyText, imageBase64 || undefined);
         sentCount += 1;
-    }
+    });
 
-    // Send "idle" status after all replies are delivered
-    await sendStatus(baseUrl, accountToken, "idle");
+    await dispatchFn({
+        cfg: ctx.cfg,
+        ctxPayload: inboundCtx,
+        dispatcher,
+        onSettled: async () => {
+            // All deliveries are complete (waitForIdle resolved) before onSettled is called.
+            await sendStatus(baseUrl, accountToken, "idle");
+        },
+        replyOptions: {
+            onToolStart: ({ name, phase }) => {
+                if (phase === "end") {
+                    sendStatus(baseUrl, accountToken, "tool_calling", {
+                        emoji: "✅",
+                        tool: name || "tool",
+                        text: `${name || "tool"} done`,
+                    }).catch(() => {});
+                } else {
+                    sendStatus(baseUrl, accountToken, "tool_calling", {
+                        emoji: "🔧",
+                        tool: name || "tool",
+                        text: `Invoking ${name || "tool"}...`,
+                    }).catch(() => {});
+                }
+            },
+        },
+    });
 
     if (sentCount > 0) {
         ctx.setStatus({
@@ -874,7 +706,7 @@ async function emitInboundToGateway(ctx, inbound) {
         });
     }
 
-    return "plugin-sdk.auto-reply.getReplyFromConfig";
+    return "plugin-sdk.auto-reply.dispatchReplyFromConfigWithSettledDispatcher";
 }
 
 async function relayGatewayPairingHints({ accountId, baseUrl, token, log, notBeforeMs }) {
@@ -1072,9 +904,9 @@ const whisplayImChannel = {
             }
 
             const isAborted = () => Boolean(ctx.abortSignal && ctx.abortSignal.aborted);
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: plugin-sdk.auto-reply.getReplyFromConfig`);
-            await loadGetReplyFromConfig();
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: getReplyFromConfig ready`);
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: plugin-sdk.dispatchReplyFromConfigWithSettledDispatcher`);
+            await loadDispatchFn();
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: dispatchReplyFromConfigWithSettledDispatcher ready`);
             ctx.setStatus({
                 accountId: ctx.accountId,
                 configured: true,
