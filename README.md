@@ -6,6 +6,13 @@
 - OpenClaw sends reply messages: `POST /whisplay-im/send`
 - Optional authentication supported: `Authorization: Bearer <token>`
 
+## Compatibility
+
+- Minimum supported OpenClaw version: `2026.4.0`
+- Recommended version: latest `2026.4.x` or newer
+- This plugin now depends on the runtime-injected `channelRuntime.reply` API introduced in OpenClaw `2026.4.x`
+- Older OpenClaw releases such as `2026.3.x` are not supported
+
 ## Contents
 
 - `whisplay-im/index.js`: OpenClaw channel plugin implementation
@@ -16,6 +23,14 @@
 ## Installation
 
 This channel is a JavaScript OpenClaw plugin. No Python runtime is required.
+
+Before installing the plugin, confirm your OpenClaw version:
+
+```bash
+openclaw --version
+```
+
+If your version is lower than `2026.4.0`, upgrade OpenClaw first.
 
 ### 1) Install plugin with OpenClaw CLI
 
