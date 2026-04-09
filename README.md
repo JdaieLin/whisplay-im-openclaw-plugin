@@ -8,10 +8,11 @@
 
 ## Compatibility
 
-- Minimum supported OpenClaw version: `2026.4.0`
+- Supported OpenClaw versions: `>=2026.3.22`
 - Recommended version: latest `2026.4.x` or newer
-- This plugin now depends on the runtime-injected `channelRuntime.reply` API introduced in OpenClaw `2026.4.x`
-- Older OpenClaw releases such as `2026.3.x` are not supported
+- `2026.3.22` to `2026.3.x`: uses the legacy `plugin-sdk.dispatchReplyFromConfigWithSettledDispatcher` compatibility path
+- `2026.4.x` and newer: uses the runtime-injected `channelRuntime.reply` API
+- Startup behavior is aligned with `openclaw-weixin`: the plugin rejects hosts older than `2026.3.22`
 
 ## Contents
 
@@ -30,7 +31,7 @@ Before installing the plugin, confirm your OpenClaw version:
 openclaw --version
 ```
 
-If your version is lower than `2026.4.0`, upgrade OpenClaw first.
+If your version is lower than `2026.3.22`, upgrade OpenClaw first.
 
 ### 1) Install plugin with OpenClaw CLI
 

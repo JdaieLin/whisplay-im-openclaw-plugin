@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const CHANNEL_ID = "whisplay-im";
+const MIN_COMPAT_OPENCLAW_VERSION = "2026.3.22";
 const GATEWAY_LOG_DIR = "/tmp/openclaw";
 const GATEWAY_LOG_FILE_PATTERN = /^openclaw-\d{4}-\d{2}-\d{2}\.log$/;
 const PAIRING_CACHE_LIMIT = 256;
@@ -11,15 +13,139 @@ const pairingRelaySeen = new Map();
 const inboundSeenByAccount = new Map();
 const pollTickByAccount = new Map();
 let pluginRuntime = null;
+let legacyDispatchFnLoader = null;
 
 function getChannelRuntime() {
-    if (!pluginRuntime?.channel) {
+    return pluginRuntime?.channel ?? null;
+}
+
+function compareSemverLike(left, right) {
+    const leftParts = String(left ?? "").split(".").map((value) => Number.parseInt(value, 10) || 0);
+    const rightParts = String(right ?? "").split(".").map((value) => Number.parseInt(value, 10) || 0);
+    const length = Math.max(leftParts.length, rightParts.length);
+    for (let index = 0; index < length; index += 1) {
+        const delta = (leftParts[index] || 0) - (rightParts[index] || 0);
+        if (delta !== 0) {
+            return delta;
+        }
+    }
+    return 0;
+}
+
+function assertHostCompatibility(runtimeVersion) {
+    const version = String(runtimeVersion ?? "").trim();
+    if (!version) {
+        return;
+    }
+    if (compareSemverLike(version, MIN_COMPAT_OPENCLAW_VERSION) < 0) {
         throw new Error(
-            "whisplay-im: plugin runtime not available — " +
-            "ensure OpenClaw >= 2026.4 and plugin was registered via register(api)",
+            `whisplay-im requires OpenClaw >=${MIN_COMPAT_OPENCLAW_VERSION}; current=${version}`,
         );
     }
-    return pluginRuntime.channel;
+}
+
+async function fileExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function resolveOpenClawPackageRoot() {
+    const knownRoots = [
+        "/opt/homebrew/lib/node_modules/openclaw",
+        "/usr/local/lib/node_modules/openclaw",
+        "/home/linuxbrew/.linuxbrew/lib/node_modules/openclaw",
+    ];
+
+    const openclawBinCandidates = [
+        "/opt/homebrew/bin/openclaw",
+        "/usr/local/bin/openclaw",
+        "/opt/local/bin/openclaw",
+        "/home/linuxbrew/.linuxbrew/bin/openclaw",
+    ];
+    for (const binPath of openclawBinCandidates) {
+        try {
+            const realBin = await fs.realpath(binPath);
+            knownRoots.push(path.resolve(path.dirname(realBin), ".."));
+        } catch {
+            // ignore missing binaries
+        }
+    }
+
+    const homeDir = process.env.HOME || "/home/pi";
+    const nvmVersionsDir = path.join(homeDir, ".nvm/versions/node");
+    try {
+        const entries = await fs.readdir(nvmVersionsDir);
+        for (const entry of entries) {
+            knownRoots.push(path.join(nvmVersionsDir, entry, "lib/node_modules/openclaw"));
+        }
+    } catch {
+        // ignore missing nvm installations
+    }
+
+    for (const root of knownRoots) {
+        const sdkDir = path.join(root, "dist/plugin-sdk");
+        if (await fileExists(path.join(sdkDir, "index.js"))) {
+            return root;
+        }
+    }
+
+    throw new Error(
+        `cannot locate OpenClaw package root (checked: ${knownRoots.join(",")})`,
+    );
+}
+
+async function loadLegacyDispatchFn() {
+    if (!legacyDispatchFnLoader) {
+        legacyDispatchFnLoader = (async () => {
+            const packageRoot = await resolveOpenClawPackageRoot();
+            const sdkDir = path.join(packageRoot, "dist/plugin-sdk");
+
+            const subModulePath = path.join(sdkDir, "inbound-reply-dispatch.js");
+            if (await fileExists(subModulePath)) {
+                const subModule = await import(pathToFileURL(subModulePath).href);
+                if (typeof subModule.dispatchReplyFromConfigWithSettledDispatcher === "function") {
+                    return subModule.dispatchReplyFromConfigWithSettledDispatcher;
+                }
+            }
+
+            const indexPath = path.join(sdkDir, "index.js");
+            const sdkModule = await import(pathToFileURL(indexPath).href);
+            if (typeof sdkModule.dispatchReplyFromConfigWithSettledDispatcher === "function") {
+                return sdkModule.dispatchReplyFromConfigWithSettledDispatcher;
+            }
+
+            throw new Error(
+                "whisplay-im: no compatible inbound dispatch API found; " +
+                "requires OpenClaw >= 2026.3.22",
+            );
+        })();
+    }
+    return legacyDispatchFnLoader;
+}
+
+async function resolveDispatchCompat() {
+    const channelRuntime = getChannelRuntime();
+    if (
+        channelRuntime?.reply?.withReplyDispatcher &&
+        channelRuntime?.reply?.dispatchReplyFromConfig
+    ) {
+        return {
+            kind: "runtime",
+            source: "channelRuntime.reply.dispatchReplyFromConfig",
+            channelRuntime,
+        };
+    }
+
+    return {
+        kind: "legacy",
+        source: "plugin-sdk.dispatchReplyFromConfigWithSettledDispatcher",
+        dispatchFn: await loadLegacyDispatchFn(),
+        channelRuntime,
+    };
 }
 
 // Build a dispatcher that delivers each reply payload sequentially to the whisplay device.
@@ -153,6 +279,16 @@ function resolveInboundPeer(inbound) {
         id: peerId || "whisplay",
         name: peerName || "whisplay",
     };
+}
+
+function sanitizeSessionPart(value) {
+    return String(value ?? "")
+        .trim()
+        .replace(/[:\s]+/g, "-")
+        .replace(/[^a-zA-Z0-9._-]/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 96);
 }
 
 function getPairingSeenSet(accountId) {
@@ -523,7 +659,8 @@ function normalizeInboundItems(payload) {
 }
 
 async function emitInboundToGateway(ctx, inbound) {
-    const channelRuntime = getChannelRuntime();
+    const dispatchCompat = await resolveDispatchCompat();
+    const channelRuntime = dispatchCompat.channelRuntime;
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
     const accountLabel = toCleanText(ctx.accountId ?? ctx.account?.accountId ?? ctx.account?.id);
@@ -538,14 +675,17 @@ async function emitInboundToGateway(ctx, inbound) {
     }
     const tsNumber = Number(inbound.timestamp);
     const parsedTimestamp = Number.isFinite(tsNumber) ? tsNumber : Date.now();
-
-    // Use framework routing instead of hardcoded session keys
-    const route = channelRuntime.routing.resolveAgentRoute({
-        cfg: ctx.cfg,
-        channel: CHANNEL_ID,
-        accountId: ctx.accountId,
-        peer: { kind: "direct", id: senderId || "whisplay" },
-    });
+    const peerKey = sanitizeSessionPart(senderId || inbound.id || "unknown") || "unknown";
+    const accountKey = sanitizeSessionPart(ctx.accountId || "default") || "default";
+    const fallbackSessionKey = `agent:main:${CHANNEL_ID}:${accountKey}:direct:${peerKey}`;
+    const route = channelRuntime?.routing?.resolveAgentRoute
+        ? channelRuntime.routing.resolveAgentRoute({
+            cfg: ctx.cfg,
+            channel: CHANNEL_ID,
+            accountId: ctx.accountId,
+            peer: { kind: "direct", id: senderId || "whisplay" },
+        })
+        : { sessionKey: fallbackSessionKey };
 
     const inboundCtx = {
         Body: sanitizedInbound.text,
@@ -610,37 +750,49 @@ async function emitInboundToGateway(ctx, inbound) {
         sentCount += 1;
     });
 
-    // Dispatch using channelRuntime (following openclaw-weixin pattern)
-    await channelRuntime.reply.withReplyDispatcher({
-        dispatcher,
-        onSettled: async () => {
-            // All deliveries are complete (waitForIdle resolved) before onSettled is called.
-            await sendStatus(baseUrl, accountToken, "idle");
+    const replyOptions = {
+        onToolStart: ({ name, phase }) => {
+            if (phase === "end") {
+                sendStatus(baseUrl, accountToken, "tool_calling", {
+                    emoji: "✅",
+                    tool: name || "tool",
+                    text: `${name || "tool"} done`,
+                }).catch(() => {});
+            } else {
+                sendStatus(baseUrl, accountToken, "tool_calling", {
+                    emoji: "🔧",
+                    tool: name || "tool",
+                    text: `Invoking ${name || "tool"}...`,
+                }).catch(() => {});
+            }
         },
-        run: () =>
-            channelRuntime.reply.dispatchReplyFromConfig({
-                ctx: inboundCtx,
-                cfg: ctx.cfg,
-                dispatcher,
-                replyOptions: {
-                    onToolStart: ({ name, phase }) => {
-                        if (phase === "end") {
-                            sendStatus(baseUrl, accountToken, "tool_calling", {
-                                emoji: "✅",
-                                tool: name || "tool",
-                                text: `${name || "tool"} done`,
-                            }).catch(() => {});
-                        } else {
-                            sendStatus(baseUrl, accountToken, "tool_calling", {
-                                emoji: "🔧",
-                                tool: name || "tool",
-                                text: `Invoking ${name || "tool"}...`,
-                            }).catch(() => {});
-                        }
-                    },
-                },
-            }),
-    });
+    };
+
+    if (dispatchCompat.kind === "runtime") {
+        await channelRuntime.reply.withReplyDispatcher({
+            dispatcher,
+            onSettled: async () => {
+                await sendStatus(baseUrl, accountToken, "idle");
+            },
+            run: () =>
+                channelRuntime.reply.dispatchReplyFromConfig({
+                    ctx: inboundCtx,
+                    cfg: ctx.cfg,
+                    dispatcher,
+                    replyOptions,
+                }),
+        });
+    } else {
+        await dispatchCompat.dispatchFn({
+            cfg: ctx.cfg,
+            ctxPayload: inboundCtx,
+            dispatcher,
+            onSettled: async () => {
+                await sendStatus(baseUrl, accountToken, "idle");
+            },
+            replyOptions,
+        });
+    }
 
     if (sentCount > 0) {
         ctx.setStatus({
@@ -654,7 +806,7 @@ async function emitInboundToGateway(ctx, inbound) {
         });
     }
 
-    return "channelRuntime.reply.dispatchReplyFromConfig";
+    return dispatchCompat.source;
 }
 
 async function relayGatewayPairingHints({ accountId, baseUrl, token, log, notBeforeMs }) {
@@ -852,9 +1004,9 @@ const whisplayImChannel = {
             }
 
             const isAborted = () => Boolean(ctx.abortSignal && ctx.abortSignal.aborted);
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: channelRuntime.reply`);
-            const channelRuntime = getChannelRuntime();
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: channelRuntime.reply ready`);
+            const dispatchCompat = await resolveDispatchCompat();
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: ${dispatchCompat.source}`);
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: ${dispatchCompat.source} ready`);
             ctx.setStatus({
                 accountId: ctx.accountId,
                 configured: true,
@@ -980,6 +1132,7 @@ const plugin = {
     name: "Whisplay IM",
     description: "Whisplay IM bridge channel plugin",
     register(api) {
+        assertHostCompatibility(api.runtime?.version);
         pluginRuntime = api.runtime;
         api.registerChannel({ plugin: whisplayImChannel });
     },
